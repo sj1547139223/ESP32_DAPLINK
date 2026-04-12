@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# PlatformIO
+.pio/
+.deps/
+
+# ESP-IDF
+managed_components/
+dependencies.lock
+build.log
+sdkconfig
+sdkconfig.old
+sdkconfig.esp32s3-idf
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Config files (user-specific)
+pc-tools/config.ini
+pc-bridge/config.ini
+
+# Binary tools (user should download separately)
+pc-tools/elaphureLink_Windows_x64_release/
+pc-tools/pip
+pc-tools/python
+
+# OS
+.DS_Store
+Thumbs.db

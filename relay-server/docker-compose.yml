@@ -1,0 +1,13 @@
+version: '3'
+services:
+  relay:
+    build: .
+    ports:
+      - "7000:7000"
+      - "7001:7001"
+      - "7002:7002/udp"
+    restart: always
+    environment:
+      - PORT=7000
+      - TCP_PORT=7001
+      - STUN_PORT=7002
