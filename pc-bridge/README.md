@@ -1,12 +1,12 @@
 # DAPLink PC Bridge v1.0.0
 
-PC 端桥接工具，配合中继服务器实现跨网络无线调试。
+PC 端桥接工具，配合中继服务器实现跨网络无线调试。支持 WebSocket 和 TCP 两种中继协议。
 
 ## 版本历史
 
 | 版本 | 修改内容 |
 |------|----------|
-| **v1.0.0** | 初始版本。WebSocket中继连接、本地TCP服务器(3240)、配对码机制、config.ini配置持久化 |
+| **v1.0.0** | 初始版本。WebSocket/TCP双协议中继、本地TCP服务器(DAP:3240/串口:3241/RTT:3242)、配对码机制、config.ini配置持久化 |
 
 > 版本号定义在 `bridge.py` 文件头docstring中。
 
@@ -22,11 +22,19 @@ PC 端桥接工具，配合中继服务器实现跨网络无线调试。
 relay = ws://your-server:7000
 code = A3K7N2
 port = 3240
+serial_port = 3241
+rtt_port = 3242
+protocol = ws
+relay_tcp_port = 7001
 ```
 
-- `relay` — 中继服务器 WebSocket 地址
+- `relay` — 中继服务器地址
 - `code` — 设备配对码 (6位)
-- `port` — 本地 TCP 端口 (默认 3240)
+- `port` — 本地 DAP TCP 端口 (默认 3240)
+- `serial_port` — 本地串口 TCP 端口 (默认 3241)
+- `rtt_port` — 本地 RTT TCP 端口 (默认 3242)
+- `protocol` — 中继协议: `ws` (WebSocket) 或 `tcp` (TCP)
+- `relay_tcp_port` — TCP 中继端口 (默认 7001)
 
 留空的字段会在运行时交互式提示输入。命令行参数优先级最高。
 
@@ -35,12 +43,27 @@ port = 3240
 ```bash
 pip install -r requirements.txt
 
-# 交互式
+# 交互式 (WebSocket 模式)
 python bridge.py
 
-# 命令行参数
+# WebSocket 模式 (命令行参数)
 python bridge.py --relay ws://your-server:7000 --code A3K7N2
+
+# TCP 模式
+python bridge.py --relay your-server --code A3K7N2 --tcp
+
+# TCP 模式 (自定义端口)
+python bridge.py --relay your-server --code A3K7N2 --tcp --relay-tcp-port 7001
 ```
+
+### 两种中继协议对比
+
+| 特性 | WebSocket (默认) | TCP |
+|------|:-:|:-:|
+| 中继端口 | 7000 | 7001 |
+| 数据帧格式 | WebSocket 帧 | 2字节长度前缀 |
+| 防火墙友好 | ✅ (HTTP 升级) | 一般 |
+| 开销 | 稍高 | 更低 |
 
 ## 打包为 exe（无需 Python 环境）
 
