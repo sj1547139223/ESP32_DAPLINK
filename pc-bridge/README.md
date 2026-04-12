@@ -1,6 +1,23 @@
 # DAPLink PC Bridge v1.0.0
 
-PC 端桥接工具，配合中继服务器实现跨网络无线调试。支持 WebSocket 和 TCP 两种中继协议。
+**独立的跨网络调试桥接工具**，配合中继服务器实现跨网络无线调试。支持 WebSocket 和 TCP 两种中继协议。
+
+## 什么时候需要这个工具？
+
+```
+同网络直连（不需要本工具）:
+  Keil ←→ elaphureLink ←TCP:3240→ ESP32 DAPLink ←SWD→ 目标MCU
+
+跨网络调试（需要本工具 或 DAPLink Tool 的桥接功能）:
+  Keil ←→ elaphureLink ←TCP:3240→ [本工具] ←WS/TCP→ [中继服务器] ←→ ESP32 ←SWD→ 目标MCU
+```
+
+**与 DAPLink Tool (pc-tools) 的关系：**
+- `pc-tools/daplink_tool.py` 的"桥接"标签页已包含完整的桥接功能
+- 本工具是一个 **独立的轻量版本**，适合以下场景：
+  - 不需要 GUI，只需要桥接功能
+  - 打包为独立 exe 分发给其他人
+  - 无 tkinter 的服务器/无头环境
 
 ## 版本历史
 
