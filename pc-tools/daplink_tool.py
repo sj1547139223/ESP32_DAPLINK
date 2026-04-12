@@ -291,7 +291,14 @@ if sys.platform == "win32":
 
 APP_VERSION = "1.0.0"
 APP_TITLE = f"DAPLink Tool v{APP_VERSION}"
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+
+# When packaged with PyInstaller, __file__ points to the temp extraction dir.
+# Use the directory of the actual exe for config persistence.
+if getattr(sys, 'frozen', False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_APP_DIR, "config.ini")
 
 EL_IDENTIFIER = 0x8A656C70
 EL_CMD_HANDSHAKE = 0x00000000
@@ -3745,10 +3752,15 @@ class App(tk.Tk):
         else:
             # Find release dir relative to app
             if getattr(sys, 'frozen', False):
+                # Check both bundled dir and exe dir
                 base = sys._MEIPASS
+                base2 = os.path.dirname(os.path.abspath(sys.executable))
             else:
                 base = os.path.dirname(os.path.abspath(__file__))
+                base2 = base
             el_dir = os.path.join(base, 'elaphureLink_Windows_x64_release')
+            if not os.path.isdir(el_dir):
+                el_dir = os.path.join(base2, 'elaphureLink_Windows_x64_release')
 
         if not el_dir or not os.path.isdir(el_dir):
             messagebox.showerror("安装 Keil 驱动",
