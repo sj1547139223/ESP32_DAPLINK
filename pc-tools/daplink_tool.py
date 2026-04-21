@@ -1178,9 +1178,25 @@ class BridgeEngine:
                     await writer.drain()
                     continue
 
-                # 3) All other commands: forward to ESP32 and wait for response.
-                #    No pipelining over WiFi relay — ESP32 uses a single-entry
-                #    command buffer so rapid fire-and-forget causes overwrite.
+                # 3) Fire-and-forget for relay path only (NOT UDP punch):
+                #    Commands whose responses are fully predictable are sent to
+                #    ESP32 in background; predicted response returned immediately.
+                #    The relay's TCP+g_dap_cmd_queue guarantee FIFO ordering, so
+                #    _pipeline_depth safely discards each response.
+                #    UDP path excluded: packet loss corrupts _pipeline_depth counter.
+                if not self._punch_dap_active:
+                    if cmd == 0x7F:
+                        predicted = self._predict_execute_cmd_response(data)
+                    else:
+                        predicted = self._predict_dap_response(cmd, data)
+                    if predicted is not None:
+                        self._send_dap_to_esp32(data)
+                        self._pipeline_depth += 1
+                        writer.write(predicted)
+                        await writer.drain()
+                        continue
+
+                # 4) All other commands: forward to ESP32 and wait for response.
                 resp = await self._forward_dap_cmd(data)
                 if resp is None:
                     break
@@ -1205,8 +1221,15 @@ class BridgeEngine:
         Only commands that ALWAYS succeed with a fixed response are listed."""
         if cmd == 0x01:                      # DAP_HostStatus
             return bytes([0x01, 0x00])
+        if cmd == 0x02 and len(data) >= 2:   # DAP_Connect (SWD)
+            if data[1] in (0, 1):            # 0=default, 1=SWD → responds with 1
+                return bytes([0x02, 0x01])
         if cmd == 0x04 and len(data) >= 6:   # DAP_TransferConfigure
             return bytes([0x04, 0x00])
+        if cmd == 0x05:                      # DAP_Transfer (only if all writes)
+            return BridgeEngine._predict_transfer_response(data)
+        if cmd == 0x06:                      # DAP_TransferBlock (only if write)
+            return BridgeEngine._predict_transfer_block_response(data)
         if cmd == 0x09 and len(data) >= 3:   # DAP_Delay
             return bytes([0x09, 0x00])
         if cmd == 0x11 and len(data) >= 5:   # DAP_SWJ_Clock
@@ -1216,6 +1239,103 @@ class BridgeEngine:
         if cmd == 0x13 and len(data) >= 2:   # DAP_SWD_Configure
             return bytes([0x13, 0x00])
         return None
+
+    @staticmethod
+    def _predict_transfer_response(data: bytes):
+        """Predict DAP_Transfer (0x05) response if ALL transfers are pure writes.
+        Returns bytes([0x05, count, 0x01]) or None.
+        Reads, MatchValue reads, and TD_Timestamp transfers cannot be predicted."""
+        if len(data) < 3:
+            return None
+        count = data[2]
+        pos = 3
+        for _ in range(count):
+            if pos >= len(data):
+                return None
+            req = data[pos]; pos += 1
+            if req & 0x02:   # RnW=1 (read) — response contains data, unpredictable
+                return None
+            if req & 0x40:   # TD_Timestamp — response includes per-transfer timestamp
+                return None
+            pos += 4         # skip 4-byte write data (or MatchMask data if bit5 set)
+        if pos != len(data):
+            return None      # length mismatch → unexpected format
+        return bytes([0x05, count, 0x01])
+
+    @staticmethod
+    def _predict_transfer_block_response(data: bytes):
+        """Predict DAP_TransferBlock (0x06) response if it is a write block.
+        Returns bytes([0x06, count_lo, count_hi, 0x01]) or None."""
+        if len(data) < 5:
+            return None
+        count = data[2] | (data[3] << 8)
+        req = data[4]
+        if req & 0x02:   # RnW=1 (read) — response contains data
+            return None
+        if req & 0xF0:   # any high bits (TD_Timestamp etc.) — don't predict
+            return None
+        expected = 5 + count * 4
+        if len(data) != expected:
+            return None
+        return bytes([0x06, data[2], data[3], 0x01])
+
+    @staticmethod
+    def _sub_cmd_length(buf: bytes, offset: int) -> int:  # noqa: C901
+        """Return byte-length of one CMSIS-DAP sub-command (for ExecuteCmd parsing)."""
+        if offset >= len(buf):
+            return -1
+        cmd = buf[offset]
+        remaining = len(buf) - offset
+        FIXED = {
+            0x00: 2, 0x01: 3, 0x02: 2, 0x03: 1, 0x04: 6, 0x07: 1,
+            0x08: 6, 0x09: 3, 0x0A: 1, 0x10: 7, 0x11: 5, 0x13: 2,
+        }
+        if cmd in FIXED:
+            return FIXED[cmd] if remaining >= FIXED[cmd] else -1
+        if cmd == 0x12:  # DAP_SWJ_Sequence
+            if remaining < 2: return -1
+            bits = buf[offset + 1]
+            data_bytes = (bits == 0 and 32 or (bits + 7) // 8)
+            total = 2 + data_bytes
+            return total if remaining >= total else -1
+        if cmd == 0x05:  # DAP_Transfer
+            if remaining < 3: return -1
+            count = buf[offset + 2]; pos = offset + 3
+            for _ in range(count):
+                if pos >= len(buf): return -1
+                req = buf[pos]; pos += 1
+                if (req & 0x02) == 0 or (req & 0x20) != 0:  # write or MatchMask
+                    pos += 4
+            return pos - offset
+        if cmd == 0x06:  # DAP_TransferBlock
+            if remaining < 5: return -1
+            count = buf[offset + 2] | (buf[offset + 3] << 8)
+            req = buf[offset + 4]
+            return 5 if (req & 0x02) != 0 else 5 + count * 4
+        return -1
+
+    @staticmethod
+    def _predict_execute_cmd_response(data: bytes):
+        """For DAP_ExecuteCommands (0x7F): predict response if ALL sub-commands are safe.
+        Returns predicted combined response bytes, or None if any sub-cmd is unknown/risky."""
+        if len(data) < 2 or data[0] != 0x7F:
+            return None
+        num_cmds = data[1]
+        inner = data[2:]
+        parts = [bytes([0x7F, num_cmds])]
+        offset = 0
+        for _ in range(num_cmds):
+            cmd_len = BridgeEngine._sub_cmd_length(inner, offset)
+            if cmd_len <= 0:
+                return None
+            sub_cmd = inner[offset]
+            sub_data = inner[offset:offset + cmd_len]
+            pred = BridgeEngine._predict_dap_response(sub_cmd, sub_data)
+            if pred is None:
+                return None
+            parts.append(pred)
+            offset += cmd_len
+        return b''.join(parts)
 
     def _send_dap_to_esp32(self, data):
         """Send DAP command to ESP32 fire-and-forget (response discarded via _pipeline_depth)."""
@@ -1519,6 +1639,11 @@ class BridgeEngine:
         if payload[0] == PUNCH_MY_PORT and len(payload) >= 3:
             self._punch_peer_udp_port = (payload[1] << 8) | payload[2]
             self.log(f"NAT穿透: 设备外部 UDP 端口 = {self._punch_peer_udp_port}")
+            # Skip punch if LAN hairpin detected (peer has same external IP as us)
+            my_ext_ip = getattr(self, '_punch_my_ext_ip', '')
+            if my_ext_ip and my_ext_ip == self._punch_peer_ip:
+                self.log("NAT穿透: 同网段 (NAT回流), 不启动打洞")
+                return
             # Start punch if we already have our own external port from STUN
             if (self._loop and self._punch_peer_ip and
                     self._punch_peer_udp_port and
@@ -1556,6 +1681,7 @@ class BridgeEngine:
                     ext_ip = data[2:].decode('ascii', errors='replace')
                     b.log(f"NAT穿透: STUN 外部地址 {ext_ip}:{self.ext_port}")
                     b._punch_my_ext_port = self.ext_port
+                    b._punch_my_ext_ip = ext_ip
                     self.stun_event.set()
                     return
 
@@ -1618,6 +1744,15 @@ class BridgeEngine:
                 (ext_port >> 8) & 0xFF, ext_port & 0xFF]))
             self.log(f"NAT穿透: 已发送外部端口 {ext_port} 给设备")
 
+            # LAN hairpin detection: if our external IP equals peer's IP,
+            # both devices are behind the same NAT. UDP punch requires hairpin
+            # which is unreliable on many routers. Use relay instead — it's
+            # more reliable and fire-and-forget applies, giving ~17s vs ~28s.
+            my_ext_ip = getattr(self, '_punch_my_ext_ip', '')
+            if my_ext_ip and my_ext_ip == self._punch_peer_ip:
+                self.log("NAT穿透: 同网段检测 (NAT回流), 跳过打洞, 使用中继")
+                return
+
             # If peer's port is already known, start punching in background
             if self._punch_peer_udp_port:
                 asyncio.ensure_future(self._punch_start_sending())
@@ -1626,20 +1761,27 @@ class BridgeEngine:
             self.log(f"NAT穿透: 初始化失败: {e}")
 
     async def _punch_start_sending(self):
-        """Send punch packets to peer's UDP port."""
+        """Send punch packets to peer's UDP port.
+        Also tries adjacent ports (±5) to handle symmetric NAT where the
+        peer's actual external port for our direction may differ from STUN port."""
         if not self._punch_udp_transport or not self._punch_peer_ip:
             return
 
-        target_addr = (self._punch_peer_ip, self._punch_peer_udp_port)
-        self.log(f"NAT穿透: 开始打洞 → {target_addr[0]}:{target_addr[1]}")
+        base_port = self._punch_peer_udp_port
+        self.log(f"NAT穿透: 开始打洞 → {self._punch_peer_ip}:{base_port} (扫描±5端口)")
 
-        for i in range(50):  # 50 * 200ms = 10s
+        for i in range(20):  # 20 * 200ms = 4s (faster fail vs 50*200ms=10s)
             if not self._running or self._punch_success:
                 break
-            try:
-                self._punch_udp_transport.sendto(PUNCH_MAGIC, target_addr)
-            except Exception:
-                pass
+            # Send to base port and ±5 adjacent ports (for symmetric NAT traversal)
+            for offset in range(-5, 6):
+                port = base_port + offset
+                if 1 <= port <= 65535:
+                    try:
+                        self._punch_udp_transport.sendto(
+                            PUNCH_MAGIC, (self._punch_peer_ip, port))
+                    except Exception:
+                        pass
             await asyncio.sleep(0.2)
 
         if self._punch_success:

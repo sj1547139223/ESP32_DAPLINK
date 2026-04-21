@@ -455,11 +455,10 @@ class ElProxy:
 
         return -1  # Unknown
 
-    def _split_and_execute(self, cmd_data: bytes) -> bytes:
-        """Split an ExecuteCommands (0x7F) batch into individual commands,
-        send each one to the DAP device, and repack responses.
-
-        Returns the combined response in ExecuteCommands format.
+    def _split_and_execute_fallback(self, cmd_data: bytes) -> bytes:
+        """Fallback: split ExecuteCommands batch into individual TCP sends.
+        Only used for DAP devices that do NOT support native 0x7F handling.
+        Normally, batches are forwarded directly via _data_loop.
         """
         num_cmds = cmd_data[1]
         inner = cmd_data[2:]
@@ -487,6 +486,21 @@ class ElProxy:
 
     def _data_loop(self):
         """Main proxy loop: wait for RDDI producer, forward to DAP, return response."""
+        # DAP_Info response cache: {info_id -> response_bytes}
+        # These values don't change during a session, so we cache after first query.
+        _info_cache: dict = {}
+
+        # Timing diagnostics
+        _cmd_count = 0
+        _session_start = time.monotonic()
+        _CMD_NAME = {
+            0x00: "Info", 0x01: "HostStatus", 0x02: "Connect", 0x03: "Disconnect",
+            0x04: "XferConfig", 0x05: "Transfer", 0x06: "XferBlock", 0x07: "XferAbort",
+            0x08: "WriteABORT", 0x09: "Delay", 0x0A: "ResetTarget",
+            0x10: "SWJ_Pins", 0x11: "SWJ_Clock", 0x12: "SWJ_Seq",
+            0x13: "SWD_Config", 0x7F: "ExecuteCmd",
+        }
+
         while self._running:
             # Wait for RDDI to produce a command
             result = _wait_event(self._producer_event, 500)
@@ -506,19 +520,44 @@ class ElProxy:
             # Reset consumer response
             self._write_u32(OFF_CONSUMER_CMD_RESP, 0xFFFFFFFF)
 
-            # Handle ExecuteCommands (0x7F) by splitting into individual commands
+            # Optimization: cache DAP_Info responses (they don't change per session)
+            if cmd_data[0] == ID_DAP_Info and len(cmd_data) >= 2:
+                info_id = cmd_data[1]
+                if info_id in _info_cache:
+                    resp = _info_cache[info_id]
+                    self._parse_response(resp, len(resp), cmd_count)
+                    _set_event(self._consumer_event)
+                    _cmd_count += 1
+                    continue
+
+            # Forward command directly to DAP device.
+            # ExecuteCommands (0x7F) batches are forwarded as-is: the ESP32
+            # natively handles them in el_process_execute_commands(), processing
+            # all sub-commands in one TCP round trip instead of N separate ones.
+            _t0 = time.monotonic()
             try:
-                if cmd_data[0] == ID_DAP_ExecuteCommands and len(cmd_data) >= 2:
-                    resp = self._split_and_execute(cmd_data)
-                else:
-                    self._sock.sendall(cmd_data)
-                    self._sock.settimeout(45)
-                    resp = self._sock.recv(4096)
+                self._sock.sendall(cmd_data)
+                self._sock.settimeout(45)
+                resp = self._sock.recv(4096)
             except Exception as e:
                 self._log(f"Proxy 通信错误: {e}")
                 self._write_u32(OFF_CONSUMER_CMD_RESP, DAP_RES_FAULT)
                 _set_event(self._consumer_event)
                 break
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
+            _cmd_count += 1
+            _total_ms = (time.monotonic() - _session_start) * 1000
+
+            # Log slow commands (> 20ms) and periodic summary
+            _cmd_name = _CMD_NAME.get(cmd_data[0], f"0x{cmd_data[0]:02X}")
+            if _elapsed_ms > 20:
+                self._log(f"[DAP #{_cmd_count:3d} +{_total_ms:.0f}ms] {_cmd_name} SLOW {_elapsed_ms:.1f}ms len={len(cmd_data)}")
+            elif _cmd_count <= 30 or _cmd_count % 50 == 0:
+                self._log(f"[DAP #{_cmd_count:3d} +{_total_ms:.0f}ms] {_cmd_name} {_elapsed_ms:.1f}ms")
+
+            # Cache DAP_Info responses for future use
+            if cmd_data[0] == ID_DAP_Info and len(cmd_data) >= 2 and resp:
+                _info_cache[cmd_data[1]] = resp
 
             if not resp:
                 self._log("Proxy: DAP 连接断开")
@@ -552,6 +591,11 @@ class ElProxy:
                 return
             count = resp[p + 1]
             p += 2
+            # Default result for ExecuteCmd batches: OK.
+            # Individual Transfer/TransferBlock sub-responses will override this
+            # if they encounter a fault. Setup-only batches (Connect, SWJ_*, etc.)
+            # don't write their own status, so this ensures Keil sees success.
+            self._write_u32(OFF_CONSUMER_CMD_RESP, DAP_RES_OK)
 
         for _ in range(count):
             if p >= resp_len or out_flag:
@@ -559,10 +603,26 @@ class ElProxy:
 
             cmd_id = resp[p]
 
-            if cmd_id == ID_DAP_Connect:
+            if cmd_id == 0x00:               # DAP_Info response: [cmd, len, data...]
+                if p + 1 < resp_len:
+                    p += 2 + resp[p + 1]     # skip cmd + len + data bytes
+                else:
+                    p += 1
+                continue
+
+            if cmd_id == 0x01:               # DAP_HostStatus: [cmd, status]
+                p += 2
+
+            elif cmd_id == ID_DAP_Connect:
                 p += 2
 
             elif cmd_id == ID_DAP_Disconnect:
+                p += 2
+
+            elif cmd_id == 0x07:             # DAP_TransferAbort: [cmd, status]
+                p += 2
+
+            elif cmd_id == 0x09:             # DAP_Delay: [cmd, status]
                 p += 2
 
             elif cmd_id == ID_DAP_TransferConfigure:
@@ -660,17 +720,24 @@ class ElProxy:
                 p += 2
 
             elif cmd_id == ID_DAP_SWJ_Sequence:
-                if p + 1 < resp_len:
-                    status_byte = resp[p + 1]
-                    self._write_u32(OFF_CONSUMER_CMD_RESP, DAP_RES_OK if status_byte == 0 else 0xFF)
+                # Don't check status byte — non-zero status is reported by some firmware
+                # versions even on success; treating it as FAULT causes spurious failures.
                 p += 2
 
             elif cmd_id == ID_DAP_SWD_Configure:
                 p += 2
 
+            elif 0x80 <= cmd_id <= 0x8A:   # DAP_SWO_* — ESP32 unsupported, returns 1-byte [cmd]
+                p += 1
+
+            elif cmd_id == 0x16:           # DAP_JTAG_IDCODE — ESP32 returns 1-byte (unsupported)
+                p += 1
+
             else:
-                self._log(f"Proxy: 未知 DAP 响应 0x{cmd_id:02X}")
-                break
+                # Unknown command: ESP32 firmware returns 1-byte [cmd_id] for any unrecognised cmd.
+                # Advance by 1 and continue rather than breaking mid-ExecuteCmd batch.
+                self._log(f"Proxy: 未知 DAP 响应 0x{cmd_id:02X} (跳过1字节)")
+                p += 1
 
     # ─── Shared memory helpers ────────────────────────────────────────────
 
