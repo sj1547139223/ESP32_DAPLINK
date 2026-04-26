@@ -855,8 +855,29 @@ class BridgeEngine:
 
     def stop(self):
         self._running = False
+        self._paired = False
+        # Close async connections to unblock readers (let coroutines exit naturally)
         if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            def _close_connections():
+                try:
+                    if self._ws:
+                        asyncio.ensure_future(self._ws.close())
+                except Exception:
+                    pass
+                try:
+                    if self._tcp_writer:
+                        self._tcp_writer.close()
+                except Exception:
+                    pass
+            self._loop.call_soon_threadsafe(_close_connections)
+        # Wait for natural shutdown first
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=8)
+        # Force stop event loop only as last resort
+        if self._thread and self._thread.is_alive():
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=3)
 
     def send_serial(self, data: bytes):
         if self._loop and self._running:
@@ -998,21 +1019,60 @@ class BridgeEngine:
             self._loop.run_until_complete(
                 self._main(relay_url, relay_host, relay_port, code, esp_ip, esp_port,
                            dap_port, serial_port, rtt_port, relay_protocol, relay_tcp_port))
+        except RuntimeError as e:
+            if "Event loop stopped" in str(e):
+                self.log("桥接引擎正在关闭...")
+            else:
+                self.log(f"桥接错误: {e}")
+                import traceback
+                self.log(f"详细错误: {traceback.format_exc()}")
         except Exception as e:
             self.log(f"桥接错误: {e}")
+            import traceback
+            self.log(f"详细错误: {traceback.format_exc()}")
         finally:
+            # Cancel remaining tasks and close event loop cleanly
+            try:
+                if self._loop and not self._loop.is_closed():
+                    pending = asyncio.all_tasks(self._loop)
+                    for task in pending:
+                        task.cancel()
+                    # Run the loop briefly to let cancellations propagate
+                    if pending:
+                        try:
+                            self._loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True))
+                        except Exception:
+                            pass
+                    self._loop.close()
+            except Exception:
+                pass
             self._running = False
             self._paired = False
+            self.log("桥接引擎已完全停止")
 
     async def _main(self, relay_url, relay_host, relay_port, code, esp_ip, esp_port,
                     dap_port, serial_port, rtt_port, relay_protocol, relay_tcp_port):
         if self._mode == "relay":
-            if relay_protocol == "tcp":
-                await self._run_tcp_relay(relay_host, relay_tcp_port, code,
-                                          dap_port, serial_port, rtt_port)
-            else:
-                await self._run_relay(relay_url, relay_host, relay_port, code,
-                                      dap_port, serial_port, rtt_port)
+            while self._running:
+                try:
+                    if relay_protocol == "tcp":
+                        await self._run_tcp_relay(relay_host, relay_tcp_port, code,
+                                                  dap_port, serial_port, rtt_port)
+                    else:
+                        await self._run_relay(relay_url, relay_host, relay_port, code,
+                                              dap_port, serial_port, rtt_port)
+                except Exception as e:
+                    if not self._running:
+                        break
+                    self.log(f"桥接异常: {e}")
+                if not self._running:
+                    break
+                self.log("中继连接断开, 3秒后自动重连...")
+                for _ in range(30):
+                    if not self._running:
+                        break
+                    await asyncio.sleep(0.1)
         else:
             await self._run_direct(esp_ip, esp_port, dap_port)
 
@@ -1091,10 +1151,16 @@ class BridgeEngine:
             await relay_task
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            self.log(f"中继任务异常: {e}")
         finally:
             dap_server.close()
             serial_server.close()
             rtt_server.close()
+            # Wait for servers to close
+            await dap_server.wait_closed()
+            await serial_server.wait_closed()
+            await rtt_server.wait_closed()
             if self._ws:
                 await self._ws.close()
             self._paired = False
@@ -1103,7 +1169,9 @@ class BridgeEngine:
     async def _relay_reader(self):
         try:
             async for msg in self._ws:
-                if isinstance(msg, bytes) and self._paired:
+                if isinstance(msg, bytes):
+                    if not self._paired:
+                        continue
                     if len(msg) > 1:
                         ch = msg[0]
                         payload = msg[1:]
@@ -1126,16 +1194,61 @@ class BridgeEngine:
                 elif isinstance(msg, str):
                     d = json.loads(msg)
                     if d.get("type") == "device_disconnected":
-                        self.log("✗ 设备断开")
+                        self.log("✗ 设备断开, 等待重连...")
                         self._paired = False
-                        return
+                        self._on_device_disconnect()
+                    elif d.get("type") == "paired":
+                        self.log("✓ 设备已重新连接")
+                        self._on_device_reconnect()
+                        self._paired = True
         except websockets.exceptions.ConnectionClosed:
-            self.log("✗ 中继断开")
+            self.log("✗ 中继连接断开")
             self._paired = False
+
+    def _on_device_disconnect(self):
+        """Clean up state when device disconnects from relay."""
+        self._pipeline_depth = 0
+        self._dap_info_cache.clear()
+        self._punch_dap_active = False
+        # Wake up any blocked _forward_dap_cmd by putting sentinel
+        try:
+            self._pending_dap.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    def _on_device_reconnect(self):
+        """Reset state when device reconnects to relay."""
+        self._pipeline_depth = 0
+        self._dap_info_cache.clear()
+        # Drain any stale items from pending queue
+        while not self._pending_dap.empty():
+            try:
+                self._pending_dap.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        while not self._pending_flash.empty():
+            try:
+                self._pending_flash.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def _handle_el_client(self, reader, writer):
         addr = writer.get_extra_info("peername")
         self.log(f"elaphureLink 已连接: {addr}")
+
+        # Wait for device to be paired before proceeding
+        wait_count = 0
+        while self._running and not self._paired:
+            await asyncio.sleep(0.5)
+            wait_count += 1
+            if wait_count >= 120:  # 60s timeout
+                self.log(f"elaphureLink 等待设备超时: {addr}")
+                writer.close()
+                return
+        if not self._running:
+            writer.close()
+            return
+
         handshake_done = False
         self._dap_info_cache.clear()
         self._pipeline_depth = 0
@@ -1347,6 +1460,8 @@ class BridgeEngine:
 
     async def _forward_dap_cmd(self, data):
         """Send DAP command to ESP32 and wait for response. Returns bytes or None."""
+        if not self._paired:
+            return None
         if self._punch_dap_active:
             sent = self._send_dap_via_udp(data)
             if not sent:
@@ -1356,15 +1471,21 @@ class BridgeEngine:
             await self._relay_send(bytes([WS_CHANNEL_DAP]) + data)
         try:
             timeout = 2.0 if self._punch_dap_active else 30.0
-            return await asyncio.wait_for(self._pending_dap.get(), timeout=timeout)
+            resp = await asyncio.wait_for(self._pending_dap.get(), timeout=timeout)
+            if resp is None:
+                return None
+            return resp
         except asyncio.TimeoutError:
             if self._punch_dap_active:
                 self.log("  ⚠ UDP响应超时, 禁用直连")
                 self._punch_dap_active = False
                 await self._relay_send(bytes([WS_CHANNEL_DAP]) + data)
                 try:
-                    return await asyncio.wait_for(
+                    resp = await asyncio.wait_for(
                         self._pending_dap.get(), timeout=30.0)
+                    if resp is None:
+                        return None
+                    return resp
                 except asyncio.TimeoutError:
                     self.log("  ⚠ 响应超时 (30s)")
                     return None
@@ -1543,10 +1664,16 @@ class BridgeEngine:
             await relay_task
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            self.log(f"中继任务异常: {e}")
         finally:
             dap_server.close()
             serial_server.close()
             rtt_server.close()
+            # Wait for servers to close
+            await dap_server.wait_closed()
+            await serial_server.wait_closed()
+            await rtt_server.wait_closed()
             if self._punch_udp_transport:
                 self._punch_udp_transport.close()
                 self._punch_udp_transport = None
@@ -1562,7 +1689,7 @@ class BridgeEngine:
     async def _tcp_relay_reader(self):
         """Read length-prefixed messages from TCP relay and dispatch."""
         try:
-            while self._running and self._paired:
+            while self._running:
                 # Read 2-byte length header
                 try:
                     hdr = await asyncio.wait_for(
@@ -1572,6 +1699,7 @@ class BridgeEngine:
                 if hdr is None:
                     self.log("✗ TCP中继断开")
                     self._paired = False
+                    self._on_device_disconnect()
                     return
                 msg_len = (hdr[0] << 8) | hdr[1]
                 if msg_len <= 0 or msg_len > 4096:
@@ -1582,17 +1710,44 @@ class BridgeEngine:
                     body = await asyncio.wait_for(
                         self._read_exact(msg_len), timeout=10.0)
                 except asyncio.TimeoutError:
-                    self.log("⚠ TCP中继: 消息体读取超时")
-                    continue
+                    # Stream is desynchronized after partial read - cannot recover
+                    self.log("⚠ TCP中继: 消息体读取超时, 连接已损坏")
+                    self._paired = False
+                    self._on_device_disconnect()
+                    return
                 if body is None:
                     self._paired = False
+                    self._on_device_disconnect()
                     return
 
-                # Check for length-prefixed disconnect [0x00, 0x01, 0x02]
+                # Check for device disconnect notification
                 if msg_len == 1 and body[0] == 0x02:
-                    self.log("✗ 设备断开")
+                    self.log("✗ 设备断开, 等待重连...")
                     self._paired = False
-                    return
+                    self._on_device_disconnect()
+                    continue
+
+                # Check for re-pair notification (length-prefixed by relay)
+                if not self._paired and len(body) >= 1 and body[0] == 0x01:
+                    if len(body) >= 4:
+                        peer_port = (body[1] << 8) | body[2]
+                        ip_len = body[3]
+                        peer_ip = body[4:4+ip_len].decode('ascii', errors='replace') if ip_len > 0 and len(body) >= 4 + ip_len else None
+                        if peer_ip:
+                            self.log(f"✓ 设备已重新连接 (peer: {peer_ip}:{peer_port})")
+                            self._punch_peer_ip = peer_ip
+                            self._punch_peer_port = peer_port
+                        else:
+                            self.log("✓ 设备已重新连接")
+                    else:
+                        self.log("✓ 设备已重新连接")
+                    self._on_device_reconnect()
+                    self._paired = True
+                    continue
+
+                # Only dispatch data when paired
+                if not self._paired:
+                    continue
 
                 # Dispatch by channel
                 if len(body) > 1:
@@ -1619,6 +1774,7 @@ class BridgeEngine:
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             self.log(f"✗ TCP中继断开: {e}")
             self._paired = False
+            self._on_device_disconnect()
 
     async def _read_exact(self, n):
         """Read exactly n bytes from TCP relay, return None on disconnect."""
@@ -3956,6 +4112,12 @@ class App(tk.Tk):
         if self._el_proxy and self._el_proxy.is_running:
             self._log_q.put("内置代理已在运行")
             return
+
+        # Check if bridge is running and ready
+        if not self.bridge_engine.is_running:
+            self._log_q.put("⚠ 警告: 桥接引擎未运行，内置代理可能无法连接")
+            self._log_q.put("建议: 先启动桥接，等待'桥接就绪'消息后再启动代理")
+
         try:
             dap_port = int(self._dap_port_var.get())
         except ValueError:
@@ -4223,6 +4385,15 @@ class App(tk.Tk):
                     if not self.bridge_engine.is_running:
                         self._bridge_status.config(text="未连接", foreground="gray")
                         self._bridge_btn.config(text="启动桥接")
+                        # CRITICAL FIX: Stop ElProxy when BridgeEngine stops
+                        # This prevents ElProxy from infinitely retrying to connect
+                        # to a non-existent TCP server
+                        if self._el_proxy and self._el_proxy.is_running:
+                            self._log_q.put("检测到桥接引擎已停止，自动停止内置代理")
+                            self._stop_el_proxy()
+                    elif "等待重连" in msg or "自动重连" in msg:
+                        self._bridge_status.config(
+                            text="等待重连...", foreground="orange")
         except queue.Empty:
             pass
 

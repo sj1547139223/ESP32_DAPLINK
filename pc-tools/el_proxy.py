@@ -235,6 +235,10 @@ class ElProxy:
             self._running = False
             return
 
+        retry_count = 0
+        max_retries = 30  # Maximum consecutive failures before giving up
+        initial_retry_delay = 0.5  # Start with shorter delay for initial connection
+
         while self._running:
             try:
                 self._connect_dap(host, port)
@@ -242,11 +246,43 @@ class ElProxy:
                 self._get_device_info()
                 self._mark_ready()
                 self._log(f"elaphureLink Proxy 就绪 (DAP @ {host}:{port})")
+                retry_count = 0  # Reset retry count on successful connection
+                initial_retry_delay = 0.5  # Reset delay
                 self._data_loop()
+            except ConnectionRefusedError as e:
+                # Connection refused - server not ready yet, retry quickly
+                if not self._running:
+                    break
+                retry_count += 1
+                self._log(f"Proxy 连接被拒绝 (服务器未就绪)")
+
+                # Give up after too many consecutive failures
+                if retry_count >= max_retries:
+                    self._log(f"Proxy 连接失败次数过多 ({retry_count}次)，停止重试")
+                    self._running = False
+                    break
+
+                # Use shorter delay for connection refused (server not ready)
+                delay = min(initial_retry_delay * retry_count, 2.0)
+                if retry_count <= 3 or retry_count % 5 == 0:
+                    self._log(f"Proxy 等待桥接就绪... (尝试 {retry_count}/{max_retries})")
+                for _ in range(int(delay * 10)):
+                    if not self._running:
+                        break
+                    time.sleep(0.1)
+                continue
             except Exception as e:
                 if not self._running:
                     break
-                self._log(f"Proxy 连接错误: {e}")
+                retry_count += 1
+                if retry_count <= 3 or retry_count % 5 == 0:
+                    self._log(f"Proxy 连接错误: {e}")
+
+                # Give up after too many consecutive failures
+                if retry_count >= max_retries:
+                    self._log(f"Proxy 连接失败次数过多 ({retry_count}次)，停止重试")
+                    self._running = False
+                    break
             finally:
                 self._mark_not_ready()
                 if self._sock:
@@ -256,8 +292,9 @@ class ElProxy:
                         pass
                     self._sock = None
 
-            if self._running:
-                self._log("Proxy 将在 2 秒后重连...")
+            if self._running and retry_count > 0:
+                if retry_count <= 3 or retry_count % 5 == 0:
+                    self._log(f"Proxy 将在 2 秒后重连... (尝试 {retry_count}/{max_retries})")
                 for _ in range(20):  # 2s in 100ms chunks
                     if not self._running:
                         break
@@ -306,8 +343,13 @@ class ElProxy:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(10)
-        self._sock.connect((host, port))
-        self._log(f"TCP 已连接: {host}:{port}")
+        try:
+            self._sock.connect((host, port))
+            self._log(f"TCP 已连接: {host}:{port}")
+        except (ConnectionRefusedError, OSError) as e:
+            # Connection refused likely means the bridge server isn't ready yet
+            # This is normal during startup, so use a shorter timeout for retry
+            raise ConnectionRefusedError(f"连接被拒绝 (服务器可能未就绪): {e}")
 
     def _do_handshake(self):
         """Perform elaphureLink handshake with the DAP device."""
@@ -340,6 +382,7 @@ class ElProxy:
             self._write_u32(OFF_INFO_CAPABILITIES, caps_val)
 
         self._log(f"设备: {name}, SN: {sn}, FW: {fw}")
+        self._log(f"共享内存已填充设备信息，Keil RDDI应该可以读取")
 
     def _dap_info_query(self, info_id: int) -> str:
         """Send DAP_Info command and return the string result."""
@@ -360,6 +403,7 @@ class ElProxy:
 
     def _mark_ready(self):
         self._write_u32(OFF_INFO_PROXY_READY, 1)
+        self._log("Proxy 已标记为就绪 (共享内存 PROXY_READY = 1)")
 
     def _mark_not_ready(self):
         if self._shm_ptr:

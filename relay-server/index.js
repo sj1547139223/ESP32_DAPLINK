@@ -146,7 +146,7 @@ const TCP_STATUS_REGISTERED = 0x00;
 const TCP_STATUS_PAIRED = 0x01;
 const TCP_STATUS_PEER_DISCONNECTED = 0x02;
 
-// TCP room storage: code -> { device: socket, client: socket, deviceAddr, clientAddr, paired }
+// TCP room storage: code -> { device: socket, client: socket, deviceAddr, clientAddr, paired, clientWasPaired, deviceWasPaired }
 const tcpRooms = new Map();
 
 const tcpServer = net.createServer({ noDelay: true }, (socket) => {
@@ -180,16 +180,28 @@ const tcpServer = net.createServer({ noDelay: true }, (socket) => {
             const extra = headerBuf.slice(2 + codeLen); // any leftover data after header
 
             if (!tcpRooms.has(code)) {
-                tcpRooms.set(code, { device: null, client: null, deviceAddr: null, clientAddr: null, paired: false });
+                tcpRooms.set(code, { device: null, client: null, deviceAddr: null, clientAddr: null, paired: false, clientWasPaired: false, deviceWasPaired: false });
             }
 
             const room = tcpRooms.get(code);
 
-            // Close previous connection of same role
+            // Close previous connection of same role:
+            // CRITICAL: Send disconnect to peer FIRST, then destroy old socket.
+            // Without this, peer never learns old connection left and stays
+            // in length-prefixed mode, corrupting the next paired notification.
             if (role === 'device' && room.device) {
+                if (room.client && !room.client.destroyed && room.paired) {
+                    room.client.write(Buffer.from([0x00, 0x01, TCP_STATUS_PEER_DISCONNECTED]));
+                }
                 room.device.destroy();
+                room.paired = false;
             } else if (role === 'client' && room.client) {
+                if (room.device && !room.device.destroyed && room.paired) {
+                    room.device.write(Buffer.from([0x00, 0x01, TCP_STATUS_PEER_DISCONNECTED]));
+                }
                 room.client.destroy();
+                room.clientWasPaired = false;  // New client starts in raw mode
+                room.paired = false;
             }
 
             const addr = { ip: socket.remoteAddress, port: socket.remotePort };
@@ -219,6 +231,7 @@ const tcpServer = net.createServer({ noDelay: true }, (socket) => {
                 const cliInfo = room.clientAddr;
 
                 // To device: send client's public address
+                // ALWAYS raw: device switches to raw mode after disconnect notification
                 const cliIpBuf = Buffer.from(cliInfo.ip.replace('::ffff:', ''));
                 const devPairMsg = Buffer.alloc(4 + cliIpBuf.length);
                 devPairMsg[0] = TCP_STATUS_PAIRED;
@@ -234,9 +247,18 @@ const tcpServer = net.createServer({ noDelay: true }, (socket) => {
                 cliPairMsg.writeUInt16BE(devInfo.port, 1);
                 cliPairMsg[3] = devIpBuf.length;
                 devIpBuf.copy(cliPairMsg, 4);
-                room.client.write(cliPairMsg);
+                // If client was previously paired, it's in length-prefixed mode:
+                // wrap the paired notification with a 2-byte length header
+                if (room.clientWasPaired) {
+                    const lenHdr = Buffer.alloc(2);
+                    lenHdr.writeUInt16BE(cliPairMsg.length, 0);
+                    room.client.write(Buffer.concat([lenHdr, cliPairMsg]));
+                } else {
+                    room.client.write(cliPairMsg);
+                }
 
                 room.paired = true;
+                room.clientWasPaired = true;
                 console.log(`TCP Paired: ${code}`);
             } else {
                 socket.write(Buffer.from([TCP_STATUS_REGISTERED]));
@@ -281,6 +303,7 @@ const tcpServer = net.createServer({ noDelay: true }, (socket) => {
                     }
                 }
                 room.paired = false;
+                room.deviceWasPaired = false;  // Next device will be fresh (raw mode)
             } else if (role === 'client' && room.client === socket) {
                 room.client = null;
                 room.clientAddr = null;
@@ -294,6 +317,7 @@ const tcpServer = net.createServer({ noDelay: true }, (socket) => {
                     }
                 }
                 room.paired = false;
+                room.clientWasPaired = false;  // Next client will be fresh (raw mode)
             }
             if (!room.device && !room.client) {
                 tcpRooms.delete(code);

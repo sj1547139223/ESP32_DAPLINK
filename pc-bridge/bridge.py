@@ -130,7 +130,9 @@ class DAPLinkBridge:
         """Read responses from relay (from ESP32) and dispatch by channel."""
         try:
             async for msg in self.ws:
-                if isinstance(msg, bytes) and self.paired:
+                if isinstance(msg, bytes):
+                    if not self.paired:
+                        continue
                     if len(msg) > 1:
                         channel = msg[0]
                         payload = msg[1:]
@@ -146,9 +148,22 @@ class DAPLinkBridge:
                 elif isinstance(msg, str):
                     data = json.loads(msg)
                     if data.get("type") == "device_disconnected":
-                        print("\n✗ 设备已断开连接")
+                        print("\n✗ 设备断开, 等待重连...")
                         self.paired = False
-                        break
+                        # Wake up any blocked handle_el_client
+                        try:
+                            self._pending_resp.put_nowait(None)
+                        except asyncio.QueueFull:
+                            pass
+                    elif data.get("type") == "paired":
+                        print("\n✓ 设备已重新连接")
+                        # Drain stale responses
+                        while not self._pending_resp.empty():
+                            try:
+                                self._pending_resp.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        self.paired = True
         except websockets.exceptions.ConnectionClosed:
             print("\n✗ 中继连接断开")
             self.paired = False
@@ -158,6 +173,20 @@ class DAPLinkBridge:
         """Handle one elaphureLink TCP client connection."""
         addr = writer.get_extra_info('peername')
         print(f"elaphureLink 已连接: {addr}")
+
+        # Wait for device to be paired before proceeding
+        wait_count = 0
+        while self.running and not self.paired:
+            await asyncio.sleep(0.5)
+            wait_count += 1
+            if wait_count >= 120:  # 60s timeout
+                print(f"elaphureLink 等待设备超时: {addr}")
+                writer.close()
+                return
+        if not self.running:
+            writer.close()
+            return
+
         self.tcp_writer = writer
         self.el_handshake_done = False
 
@@ -187,11 +216,15 @@ class DAPLinkBridge:
                     break
 
                 # Forward CMSIS-DAP command to ESP32 via relay
+                if not self.paired:
+                    break
                 await self.ws.send(bytes([WS_CHANNEL_DAP]) + data)
 
                 # Wait for response from ESP32
                 try:
                     resp = await asyncio.wait_for(self._pending_resp.get(), timeout=30.0)
+                    if resp is None:
+                        break
                     writer.write(resp)
                     await writer.drain()
                 except asyncio.TimeoutError:
@@ -469,7 +502,7 @@ class DAPLinkBridgeTCP:
     async def relay_reader(self):
         """Read length-prefixed messages from TCP relay and dispatch by channel."""
         try:
-            while self.running and self.paired:
+            while self.running:
                 # Read 2-byte length header
                 try:
                     hdr = await asyncio.wait_for(
@@ -489,16 +522,49 @@ class DAPLinkBridgeTCP:
                     body = await asyncio.wait_for(
                         self._read_exact(msg_len), timeout=10.0)
                 except asyncio.TimeoutError:
-                    continue
+                    # Stream is desynchronized after partial read - cannot recover
+                    print("\n⚠ TCP 中继: 消息体读取超时, 连接已损坏")
+                    self.paired = False
+                    return
                 if body is None:
                     self.paired = False
                     return
 
-                # Check for disconnect notification
+                # Check for device disconnect notification
                 if msg_len == 1 and body[0] == TCP_STATUS_PEER_DISCONNECTED:
-                    print("\n✗ 设备已断开连接")
+                    print("\n✗ 设备断开, 等待重连...")
                     self.paired = False
-                    return
+                    # Wake up any blocked handle_el_client
+                    try:
+                        self._pending_resp.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+                    continue
+
+                # Check for re-pair notification (length-prefixed by relay)
+                if not self.paired and len(body) >= 1 and body[0] == TCP_STATUS_PAIRED:
+                    if len(body) >= 4:
+                        peer_port = (body[1] << 8) | body[2]
+                        ip_len = body[3]
+                        peer_ip = body[4:4+ip_len].decode('ascii', errors='replace') if ip_len > 0 and len(body) >= 4 + ip_len else None
+                        if peer_ip:
+                            print(f"\n✓ 设备已重新连接 (peer: {peer_ip}:{peer_port})")
+                        else:
+                            print("\n✓ 设备已重新连接")
+                    else:
+                        print("\n✓ 设备已重新连接")
+                    # Drain stale responses
+                    while not self._pending_resp.empty():
+                        try:
+                            self._pending_resp.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    self.paired = True
+                    continue
+
+                # Only dispatch data when paired
+                if not self.paired:
+                    continue
 
                 # Dispatch by channel
                 if len(body) > 1:
@@ -522,6 +588,20 @@ class DAPLinkBridgeTCP:
         """Handle one elaphureLink TCP client connection."""
         addr = writer.get_extra_info('peername')
         print(f"elaphureLink 已连接: {addr}")
+
+        # Wait for device to be paired before proceeding
+        wait_count = 0
+        while self.running and not self.paired:
+            await asyncio.sleep(0.5)
+            wait_count += 1
+            if wait_count >= 120:  # 60s timeout
+                print(f"elaphureLink 等待设备超时: {addr}")
+                writer.close()
+                return
+        if not self.running:
+            writer.close()
+            return
+
         self.tcp_writer = writer
         self.el_handshake_done = False
 
@@ -549,10 +629,14 @@ class DAPLinkBridgeTCP:
                     break
 
                 # Forward CMSIS-DAP command to ESP32 via TCP relay
+                if not self.paired:
+                    break
                 await self._relay_send(bytes([WS_CHANNEL_DAP]) + data)
 
                 try:
                     resp = await asyncio.wait_for(self._pending_resp.get(), timeout=30.0)
+                    if resp is None:
+                        break
                     writer.write(resp)
                     await writer.drain()
                 except asyncio.TimeoutError:
