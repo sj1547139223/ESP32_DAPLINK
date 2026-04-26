@@ -346,10 +346,13 @@ class ElProxy:
         try:
             self._sock.connect((host, port))
             self._log(f"TCP 已连接: {host}:{port}")
-        except (ConnectionRefusedError, OSError) as e:
-            # Connection refused likely means the bridge server isn't ready yet
-            # This is normal during startup, so use a shorter timeout for retry
+        except ConnectionRefusedError as e:
+            # Connection refused means the bridge server isn't listening yet
             raise ConnectionRefusedError(f"连接被拒绝 (服务器可能未就绪): {e}")
+        except OSError as e:
+            # Timeout, network-unreachable, reset, etc. — propagate as-is
+            # so the caller uses the general-error retry path (longer delay)
+            raise
 
     def _do_handshake(self):
         """Perform elaphureLink handshake with the DAP device."""

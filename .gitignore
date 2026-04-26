@@ -17,6 +17,7 @@ build/
 .deps/
 
 # ESP-IDF
+compile_commands.json
 managed_components/
 dependencies.lock
 build.log

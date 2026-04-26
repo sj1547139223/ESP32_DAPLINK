@@ -1,0 +1,9 @@
+{
+    "http.proxy": "",
+    "http.proxyStrictSSL": false,
+    "platformio-ide.useBuiltinPIOCore": true,
+    "platformio-ide.disablePIOHomeStartup": true,
+    "editor.fontSize": 14,
+    "files.encoding": "utf8",
+    "files.autoGuessEncoding": true
+}

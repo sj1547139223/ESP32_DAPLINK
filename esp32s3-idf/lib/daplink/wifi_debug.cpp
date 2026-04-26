@@ -359,31 +359,6 @@ esp_err_t init_wifi()
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), kTag, "set config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "wifi start");
 
-    // --- WiFi scan for diagnostics ---
-    esp_wifi_disconnect();  // stop auto-connect so scan can run
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGW(kTag, "Starting WiFi scan for diagnostics...");
-    wifi_scan_config_t scan_cfg = {};
-    scan_cfg.show_hidden = true;
-    esp_wifi_scan_start(&scan_cfg, true);  // blocking scan
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count > 20) ap_count = 20;
-    wifi_ap_record_t *ap_list = (wifi_ap_record_t *)malloc(ap_count * sizeof(wifi_ap_record_t));
-    if (ap_list) {
-        esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-        ESP_LOGW(kTag, "=== WiFi Scan Results (%d APs) ===", ap_count);
-        for (int i = 0; i < ap_count; i++) {
-            ESP_LOGW(kTag, "  [%d] SSID=%-32s RSSI=%d CH=%d Auth=%d",
-                     i, ap_list[i].ssid, ap_list[i].rssi,
-                     ap_list[i].primary, ap_list[i].authmode);
-        }
-        ESP_LOGW(kTag, "=== End of Scan ===");
-        free(ap_list);
-    }
-    esp_wifi_connect();  // resume connection after scan
-    // --- End scan ---
-
     ESP_LOGI(kTag, "WiFi STA starting, SSID=%s", g_ssid);
     return ESP_OK;
 }
